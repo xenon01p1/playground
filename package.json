@@ -6,15 +6,25 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "biome check . --error-on-warnings",
+    "check:staged": "biome check --staged --no-errors-on-unmatched --error-on-warnings",
+    "lint": "biome lint . --error-on-warnings",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "test": "bun test",
+    "commitmsg": "bun run scripts/commit-msg.ts",
+    "prepare": "bun run scripts/prepare.mjs"
   },
   "dependencies": {
     "hono": "4.13.21",
     "pg": "8.23.1"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.8",
     "@types/bun": "1.4.4",
     "@types/pg": "8.23.1",
+    "husky": "9.1.7",
     "typescript": "5.9.3"
   }
 }

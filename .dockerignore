@@ -3,3 +3,5 @@
 !bun.lock
 !src/
 !src/**
+!scripts/
+!scripts/prepare.mjs
