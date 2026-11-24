@@ -1,0 +1,20 @@
+{
+  "name": "cbr-playground",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "4.13.21",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "@types/pg": "8.23.1",
+    "typescript": "5.9.3"
+  }
+}
