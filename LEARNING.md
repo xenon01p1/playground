@@ -4,8 +4,8 @@
 
 Compose creates a private bridge network named `cbr-playground_default`.
 Its DNS resolves service names: the API connects to **`db:5432`**.
-Other containers could reach Redis at **`redis:6379`**, but this API does not
-use Redis and has no Redis client dependency.
+The API connects to Redis at **`redis:6379`** for optional product caching
+using ioredis; PostgreSQL remains the source of truth.
 
 `localhost` inside a container means that container itself. The API listens
 on `0.0.0.0:3000` so Docker can forward requests to it.
@@ -22,7 +22,7 @@ Redis host publications are for learning and direct tools; the API does not
 need them to communicate with the database.
 
 The API waits for the database health check on initial Compose startup. Redis
-has its own health check but is not an API dependency. `--wait` also waits for
+has its own health check but is not a required startup dependency for the API. `--wait` also waits for
 Redis to become healthy. Startup dependencies do not prevent later outages
 or automatically restart dependent services.
 
@@ -39,6 +39,7 @@ to each container. `.env.example` documents values without real credentials.
 | `API_HOST_PORT` | Host port forwarded to API port 3000; default 3100. |
 | `POSTGRES_HOST_PORT` | Host port forwarded to database port 5432; default 5433. |
 | `REDIS_HOST_PORT` | Host port forwarded to Redis port 6379; default 6380. |
+| `REDIS_HOST`, `REDIS_PORT` | Host-run API/client endpoint, default `127.0.0.1:6380`; Compose explicitly sets `redis:6379` inside the API container. |
 
 Compose also sets API variables `PGHOST=db` and `PGPORT=5432`. `pg` reads
 these standard PostgreSQL client variables directly. Separating fields avoids
@@ -74,7 +75,7 @@ delete the volume to rerun initialization. Changing the password requires
 changing the database role password as well as `.env`.
 
 Redis starts with append-only persistence enabled, writing its data under
-`/data`. Container replacement retains the volume. No cache behavior exists yet.
+`/data`. Container replacement retains the volume, including unexpired cache entries.
 
 ## Tables and money
 
@@ -87,11 +88,11 @@ totals, and stock nonnegative. Required fields cannot be null.
 in a currency with two decimal places). PostgreSQL INTEGER supports amounts
 up to 2,147,483,647 minor units; there are no floating-point money values.
 The order total is a stored amount; no SQL constraint calculates it from the
-product's current price. There is no order processing or stock adjustment yet.
+product's current price. Phase 5.1 adds deliberately unsafe order creation and stock adjustment for local learning.
 
 Timestamps include time zones and default to insertion time. `updated_at`
-is initialized automatically but must be explicitly set in any future UPDATE;
-there is no trigger to maintain it yet.
+is initialized automatically. The product PATCH route updates it explicitly;
+there is no SQL trigger for updates made outside the API.
 
 ## Health and readiness
 
@@ -212,7 +213,8 @@ The remaining steps run `bun run check`, `bun run typecheck`, and
 `bun run test`. Biome's existing configuration does not check YAML or Markdown;
 passing Biome alone does not validate the workflow file. The health test calls
 `app.request('/health')` without querying the database, so this job starts no
-PostgreSQL, Redis, or Docker services and needs no `.env` file. There is no
+PostgreSQL, Redis, or Docker services and needs no `.env` file. Product route
+tests use injected fakes; the opt-in integration script is not run by CI. There is no
 deployment or continuous delivery stage.
 
 ### Local feedback and remote enforcement
@@ -241,3 +243,101 @@ References: [GitHub Actions concepts](https://docs.github.com/en/actions/get-sta
 [checkout](https://github.com/actions/checkout),
 [setup-bun](https://github.com/oven-sh/setup-bun), and
 [required status checks and branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
+
+## Phase 4.1: Redis cache-aside
+
+A cache is a disposable copy of data used to avoid repeated database work.
+PostgreSQL owns products; Redis stores only JSON snapshots for GET requests.
+The key `cache:product:{id}` uses the normalized numeric ID, so `/products/01`
+and `/products/1` share `cache:product:1`.
+
+1. GET checks Redis. A valid cached product returns immediately with `X-Cache: HIT`.
+2. A missing key is a MISS. Query PostgreSQL with `$1`, not string interpolation.
+3. An existing product is serialized as JSON and stored using `SET key value EX 60`.
+   A 404 is not cached. HITs do not refresh expiry; 60 seconds is a fixed TTL.
+4. Redis GET, parsing, or SET failures produce `BYPASS` and the PostgreSQL result.
+   Invalid cache JSON/shape is not trusted. Internal details stay in server logs.
+5. PATCH/DELETE first modify PostgreSQL, then `DEL` the product key. Failed or
+   missing database writes do not invalidate. POST does not populate the cache.
+
+TTL means time to live. `TTL key` returns remaining seconds, `-2` means absent,
+and `-1` means no expiry (unexpected for keys created by this API). Redis expires
+keys independently of HTTP traffic. Deletion/invalidation forces the next GET
+to load the current database value, rather than waiting for TTL.
+
+The cache client has a 500ms connection timeout, 500ms command timeout, zero
+request retries, no offline queue, and no replay of unfulfilled commands.
+A 1000ms socket timeout breaks unresponsive sockets so reconnection can proceed.
+Reconnection keeps running in the background with delays capped at 2 seconds.
+HTTP requests do not wait for that retry loop. Separate awaited commands can
+add their own timeout delay; these values are not a whole-request deadline.
+Redis is optional, so it does not affect health or database readiness.
+
+Invalidation can fail after a database commit. Returning a write error would
+misrepresent a successful write, so we log the failure and preserve the HTTP
+success. The old key may reappear after reconnect and serve stale data until
+its remaining TTL expires. A racing GET can read old PostgreSQL data and fill
+the cache after another request invalidates it. These are deliberate limits of
+basic cache-aside, not solved by TTL alone. There are no locks or retry jobs.
+
+We pin `ioredis@5.10.0` with its bundled TypeScript types. BullMQ supports
+[ioredis connections](https://docs.bullmq.io/guide/connections) and currently
+[accepts ioredis >=5](https://github.com/taskforcesh/bullmq/blob/master/package.json).
+No BullMQ dependency or queue is added. Future blocking workers need their own
+connections and retry policy; this fail-fast cache connection is unsuitable.
+See [ioredis connection options](https://github.com/redis/ioredis/blob/v5.10.0/lib/redis/RedisOptions.ts).
+
+README contains exact curl/redis-cli commands for hits, misses, TTL, invalidation,
+and outages. `bun run test` uses infrastructure-independent fakes to verify
+failure handling and SQL/DEL ordering; `bun run test:integration` explicitly
+checks the real HTTP/Redis path against Compose, including a true 60s expiry
+and Redis stop/start. It is deliberately excluded from normal CI discovery.
+
+## Phase 5.1: Unsafe order creation and race conditions
+
+`POST /orders/unsafe` is deliberately unsafe and local-learning-only. It reads
+stock directly from PostgreSQL, checks the requested quantity, waits 100ms with
+`Bun.sleep(100)`, writes `newStock = stock - quantity`, inserts the order using
+integer `price * quantity`, and then invalidates the existing product cache.
+Redis never decides whether inventory is available. Invalid input returns 400,
+a missing product 404, insufficient stock 409, and a created order 201.
+Totals outside PostgreSQL INTEGER range are rejected before either write.
+
+Two requests can both read stock 100 and each sell 10. Each independently
+calculates 90 and writes 90, while both orders are recorded. This lost update
+leaves stock 90 instead of 80. With enough concurrent requests, accepted orders
+can exceed the original stock: overselling. The stock constraint can still
+remain satisfied because every stale calculated value is nonnegative.
+Cache invalidation does not serialize these PostgreSQL operations.
+
+Run the actual HTTP experiment against Compose:
+
+```sh
+docker compose up --build -d --wait
+bun run test:race
+```
+
+The script creates a new product with stock 100, sends 100 concurrent requests
+for 10 units each using `Promise.allSettled`, and reads final stock and
+`SUM(quantity)` directly from PostgreSQL for that product. Expected remaining
+stock is `100 - total units sold` (deliberately not clamped to zero); oversold
+units are `max(0, total units sold - 100)`. A stock mismatch or overselling means
+the experiment detected the race. Results depend on scheduling; they are not
+hardcoded. Non-201 HTTP responses count as rejected orders; network/timeouts
+are reported separately as request errors. A timeout does not prove no write
+occurred, which is why the database measurements matter.
+
+Each run prints its dedicated product ID and retains the product and orders
+for inspection. It does not delete data, reuse a previous experiment's product,
+or run in normal CI. Unit tests separately cover validation, parameterized SQL,
+invalidation after both writes, and Redis failure handling without Docker.
+
+There are deliberately no transactions, locks, atomic conditional stock
+updates, or mutexes. An insert failure can leave the earlier stock update
+committed without an order or cache invalidation. Failed Redis invalidation
+still preserves a successful order response and can leave stale cached stock.
+These limitations are part of Phase 5.1; no concurrency solutions are added.
+
+Observed Docker run: 100 successful orders, 0 rejected orders, 0 request errors,
+1,000 units sold, expected remaining stock -900, actual stock 90, and 900 units
+oversold. These are measured results from one run, not guaranteed future values.

@@ -1,7 +1,7 @@
 # Backend engineering playground
 
-A small Bun + Hono API, PostgreSQL, and Redis stack for learning Docker.
-No product/order endpoints or Redis integration are included.
+A small Bun + Hono API, PostgreSQL, and Redis stack for learning backend engineering.
+Product CRUD uses PostgreSQL, with Redis cache-aside on product reads. The order experiment is deliberately unsafe and local-learning-only.
 
 ## Start and stop
 
@@ -62,7 +62,8 @@ curl -i --max-time 10 http://127.0.0.1:3100/ready  # 200 again
 | --- | --- | --- |
 | Bun image | `oven/bun:1.4.4` | Matches the host runtime; runs TypeScript directly. |
 | PostgreSQL image | `postgres:17.11-alpine3.23` | Available locally; explicit PostgreSQL patch and Alpine version with the simple PostgreSQL 17 data path. |
-| Redis image | `redis:7.4.12-alpine3.22` | Explicit Redis 7 maintenance release and Alpine version; sufficient for PING and persistence exercises. |
+| Redis image | `redis:7.4.12-alpine3.22` | Explicit Redis 7 maintenance release and Alpine version; supports the cache and persistence exercises. |
+| ioredis | `5.10.0` | Pinned Redis 5.x client with types included; compatible with BullMQ's supported ioredis range. |
 | Hono | `4.13.21` | Small framework with native Bun support. |
 | `pg` | `8.23.1` | Simple PostgreSQL client with raw SQL and explicit timeout controls. |
 | TypeScript | `5.9.3` | Stable compiler sufficient for this small project. |
@@ -144,7 +145,8 @@ bun run test
 ```
 
 CI sets `HUSKY=0` to skip hook installation through the existing prepare script.
-The current health test needs no PostgreSQL, Redis, Docker, or secrets. This
+The default tests need no PostgreSQL, Redis, Docker, or secrets; product route
+tests inject small database/cache fakes. Integration checks are opt-in. This
 workflow only validates code; it does not deploy or provide continuous delivery.
 
 Local hooks give feedback before a commit/push and can be bypassed. Remote CI
@@ -169,3 +171,120 @@ To verify remotely after you choose to commit and push these changes:
 
 See [GitHub Actions concepts](https://docs.github.com/en/actions/get-started/understand-github-actions)
 and [branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
+
+## Phase 4.1: Product cache-aside
+
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /products` | JSON `name` and `price` required; `stock` defaults to 0. Returns product, 201. |
+| `GET /products/:id` | Product, 200; missing product, 404. Includes `X-Cache`. |
+| `PATCH /products/:id` | Nonempty subset of `name`, `price`, `stock`; returns updated product, 200. |
+| `DELETE /products/:id` | Deletes product, 204; missing product, 404; referenced by an order, 409. |
+
+IDs are positive PostgreSQL integers. Names must be nonblank; price and stock
+must be integers from 0 through 2,147,483,647. Prices use minor units (1299 =
+12.99 for a two-decimal currency). Unknown fields, null fields, and malformed
+JSON return 400. SQL values are parameterized; PATCH sets `updated_at`.
+Database failures return a generic 503 without internal details.
+
+GET first reads `cache:product:{id}`. `HIT` returns cached JSON; `MISS` reads
+PostgreSQL and stores a successful product for 60 seconds. Missing products
+are never cached. Cache reads/fills that fail return `BYPASS` and use the
+database result. Only GET fills the cache. Successful PATCH/DELETE commits to
+PostgreSQL before deleting the key. Cache invalidation failures are logged and
+do not turn successful writes into HTTP failures.
+
+`src/redis.ts` reads `REDIS_HOST` and `REDIS_PORT`, defaulting to
+`127.0.0.1:6380` for host development. Compose overrides these to `redis:6379`.
+If you change the published Redis port, set `REDIS_PORT` to match for host
+commands; `REDIS_HOST_PORT` only controls Docker's port mapping. Connection and
+command timeouts are 500ms, socket timeout is 1000ms, offline queuing and replay
+are disabled, and request retries are zero. Background reconnection backs off
+to at most 2 seconds between attempts. The API starts even if Redis is down;
+`/health` and PostgreSQL-only `/ready` retain their existing behavior.
+
+Manual reproduction (Bash, default ports; requires curl and Bun):
+
+```sh
+docker compose up --build -d --wait
+base=http://127.0.0.1:3100
+product_id=$(curl -fsS "$base/products" -H 'Content-Type: application/json' \
+  -d '{"name":"Cache lesson","price":1299,"stock":5}' | \
+  bun -e 'console.log((await Bun.stdin.json()).id)')
+key="cache:product:$product_id"
+curl -i "$base/products/$product_id" # X-Cache: MISS
+curl -i "$base/products/$product_id" # X-Cache: HIT
+docker compose exec -T redis redis-cli GET "$key" # JSON
+docker compose exec -T redis redis-cli TTL "$key" # Positive, at most 60
+sleep 61
+curl -i "$base/products/$product_id" # MISS after real expiration
+
+curl -i -X PATCH "$base/products/$product_id" -H 'Content-Type: application/json' \
+  -d '{"price":1599}'
+docker compose exec -T redis redis-cli EXISTS "$key" # 0: invalidated
+curl -i "$base/products/$product_id" # MISS, price 1599
+curl -i "$base/products/$product_id" # HIT
+
+docker compose stop redis
+curl -i --max-time 5 "$base/products/$product_id" # 200, BYPASS
+curl -i --max-time 5 -X PATCH "$base/products/$product_id" \
+  -H 'Content-Type: application/json' -d '{"stock":9}' # 200 despite failed invalidation
+curl -i "$base/health" # 200
+curl -i "$base/ready"  # 200 while PostgreSQL is healthy
+docker compose start redis
+sleep 3 # Allow background reconnect; retry if Redis startup takes longer.
+curl -i "$base/products/$product_id" # HIT or MISS; persisted cache may still be stale!
+docker compose exec -T redis redis-cli DEL "$key" # Remove only this lesson key.
+curl -i "$base/products/$product_id" # MISS, current stock 9
+curl -i "$base/products/$product_id" # HIT: recovery without restarting API
+
+curl -i -X DELETE "$base/products/$product_id" # 204
+docker compose exec -T redis redis-cli EXISTS "$key" # 0: invalidated
+curl -i "$base/products/$product_id" # 404, MISS
+docker compose exec -T redis redis-cli EXISTS "$key" # Still 0: no negative caching
+docker compose logs --tail=40 api # Redis failure logs, no errors leaked to clients
+```
+
+Run the same scenarios automatically, separately from CI:
+
+```sh
+bun run test             # Infrastructure-independent route tests and health test.
+bun run test:integration # Running Compose stack required; uses host Redis config.
+```
+
+The integration script takes about a minute, verifies actual expiration,
+stops/restarts this project's Redis, creates temporary products, and deletes
+its products afterward. It leaves volumes intact. Set `API_BASE_URL` and
+`REDIS_HOST`/`REDIS_PORT` when using nondefault host addresses.
+
+Known limits: cache-aside is not strongly consistent. Failed invalidation can
+leave old data (even a deleted product) visible after reconnect until the
+remaining TTL expires. Redis AOF persistence can retain such entries across
+restarts. Concurrent reads can also refill an old value after invalidation;
+direct database changes bypass invalidation. TTL bounds the lifetime of an
+entry, not an absolute consistency guarantee. There is no negative caching,
+write-through, locking, stampede protection, or background invalidation retry.
+A cache HIT can still succeed while PostgreSQL is down; `/ready` reports the
+database outage. Malformed cache data bypasses Redis until expiry/invalidation.
+
+## Phase 5.1: Deliberately unsafe orders (local learning only)
+
+`POST /orders/unsafe` accepts `{ "productId": 1, "quantity": 10 }`. Both values
+must be positive PostgreSQL integers. Responses: 400 invalid input or total
+outside integer range, 404 missing product, 409 insufficient stock, 201 created
+order. Inventory is read directly from PostgreSQL. A deliberate 100ms delay
+between the stock check and calculated update exposes concurrent lost updates
+and overselling. This endpoint is unsafe and is only for local learning.
+
+```sh
+docker compose up --build -d --wait
+bun run test:race
+```
+
+Bun loads the existing `.env`; the script connects to PostgreSQL on the published
+host port using `POSTGRES_*` values. `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+and `PGDATABASE` can override the host connection. `API_BASE_URL` overrides the
+HTTP address (default `http://127.0.0.1:${API_HOST_PORT:-3100}`). Each run retains
+a new dedicated product and its orders and prints its ID for inspection. It
+never resets existing stock or deletes data. This experiment is separate from
+`bun run test` and CI. See LEARNING for the result interpretation and limitations.

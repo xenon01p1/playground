@@ -13,11 +13,14 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "test": "bun test",
+    "test:integration": "bun run scripts/cache-integration.ts",
+    "test:race": "bun run scripts/test-race.ts",
     "commitmsg": "bun run scripts/commit-msg.ts",
     "prepare": "bun run scripts/prepare.mjs"
   },
   "dependencies": {
     "hono": "4.13.21",
+    "ioredis": "5.10.0",
     "pg": "8.23.1"
   },
   "devDependencies": {
